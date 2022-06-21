@@ -3,10 +3,8 @@ package do
 import (
 	"context"
 	"errors"
-	"math/rand"
 	"net"
 	"os"
-	"time"
 
 	"github.com/hashicorp/go-hclog"
 )
@@ -21,11 +19,6 @@ type acceptor struct {
 	settings *acceptorSettings
 
 	chanFinished chan struct{}
-}
-
-type acceptorSettings struct {
-	min int
-	max int
 }
 
 func newAcceptor(ctx context.Context, settings *acceptorSettings, logger hclog.Logger, listener net.Listener, provider upstreamProvider) *acceptor {
@@ -56,9 +49,7 @@ func (a *acceptor) acceptOnce() {
 
 		if l, ok := a.listener.(*net.TCPListener); ok {
 			// give it some random time so we always have an acceptor
-			// TODO: extract to top level variable
-			n := time.Duration(rand.Intn(a.settings.max-a.settings.min) + a.settings.min)
-			l.SetDeadline(time.Now().Add(n * time.Millisecond))
+			l.SetDeadline(a.settings.newDeadline())
 		}
 
 		// Connection setup:
@@ -80,7 +71,7 @@ func (a *acceptor) acceptOnce() {
 			return
 		}
 
-		newHandler(a.ctx, downstream, upstream).run()
+		newHandler(a.ctx, a.logger.Named(downstream.RemoteAddr().String()), downstream, upstream).run()
 		go a.acceptOnce()
 		return
 
