@@ -2,29 +2,41 @@ package do
 
 import (
 	"context"
+	"errors"
+	"io"
 	"net"
+	"os"
+	"sync"
+	"time"
 
 	"github.com/hashicorp/go-hclog"
 )
 
 func newHandler(ctx context.Context, logger hclog.Logger, downstream net.Conn, upstream net.Conn) *handler {
+	handlerCtx, handlerCancelFunc := context.WithCancel(ctx)
 	return &handler{
-		ctx:         ctx,
+		ctx:         handlerCtx,
+		ctxCancel:   handlerCancelFunc,
 		downstream:  downstream,
 		upstream:    upstream,
 		logger:      logger,
 		chanIngress: make(chan []byte),
 		chanEgress:  make(chan []byte),
+		closeMutex:  &sync.Mutex{},
 	}
 }
 
 type handler struct {
 	ctx         context.Context
+	ctxCancel   context.CancelFunc
 	downstream  net.Conn
 	upstream    net.Conn
 	logger      hclog.Logger
 	chanIngress chan []byte
 	chanEgress  chan []byte
+
+	closeMutex *sync.Mutex
+	closed     bool
 }
 
 func (h *handler) run() {
@@ -34,17 +46,40 @@ func (h *handler) run() {
 	go h.writeUpstream()
 }
 
+// do not call close directly:
+func (h *handler) close(reason string) {
+	h.closeMutex.Lock()
+	if !h.closed {
+		h.closed = true
+		h.logger.Info("closing handler", "upstream", h.upstream.RemoteAddr().String(), "reason", reason)
+		h.closeMutex.Unlock()
+		h.ctxCancel()
+		h.downstream.Close()
+		h.upstream.Close()
+		return
+	}
+	h.closeMutex.Unlock()
+}
+
 func (h *handler) readDownstream() {
 	select {
 	case <-h.ctx.Done():
-		return
+		h.logger.Debug("stopping readDownstream")
 	default:
-		buf := make([]byte, 1024*1024) // TODO: have only one instance of this buffer
+		buf := make([]byte, 1024*1024)                                       // TODO: have only one instance of this buffer
+		h.downstream.SetReadDeadline(time.Now().Add(time.Millisecond * 100)) // TODO: this needs to be configurable
 		nread, err := h.downstream.Read(buf)
 		if err != nil {
 			// TODO: handle broken pipe gracefully
-			// TODO: handle EOF gracefully
-			h.logger.Error("failed reading downstream", "reason", err)
+			if err == io.EOF {
+				h.close("downstream lost")
+			} else if errors.Is(err, os.ErrDeadlineExceeded) {
+				// it's okay, let it go!
+			} else if errors.Is(err, net.ErrClosed) {
+				// it's okay, let it go!
+			} else {
+				h.logger.Error("failed reading downstream", "reason", err)
+			}
 		} else {
 			if nread > 0 {
 				h.chanIngress <- buf[0:nread]
@@ -57,14 +92,22 @@ func (h *handler) readDownstream() {
 func (h *handler) readUpstream() {
 	select {
 	case <-h.ctx.Done():
-		return
+		h.logger.Debug("stopping readUpstream")
 	default:
-		buf := make([]byte, 1024*1024) // TODO: have only one instance of this buffer
+		buf := make([]byte, 1024*1024)                                     // TODO: have only one instance of this buffer
+		h.upstream.SetReadDeadline(time.Now().Add(time.Millisecond * 100)) // TODO: this needs to be configurable
 		nread, err := h.upstream.Read(buf)
 		if err != nil {
 			// TODO: handle broken pipe gracefully
-			// TODO: handle EOF gracefully
-			h.logger.Error("failed reading upstream", "reason", err)
+			if err == io.EOF {
+				h.close("upstream lost")
+			} else if errors.Is(err, os.ErrDeadlineExceeded) {
+				// it's okay, let it go!
+			} else if errors.Is(err, net.ErrClosed) {
+				// it's okay, let it go!
+			} else {
+				h.logger.Error("failed reading upstream", "reason", err)
+			}
 		} else {
 			if nread > 0 {
 				h.chanEgress <- buf[0:nread]
@@ -77,7 +120,7 @@ func (h *handler) readUpstream() {
 func (h *handler) writeDownstream() {
 	select {
 	case <-h.ctx.Done():
-		return
+		h.logger.Debug("stopping writeDownstream")
 	case data := <-h.chanEgress:
 		datalen := len(data)
 		nwritten, err := h.downstream.Write(data)
@@ -96,7 +139,7 @@ func (h *handler) writeDownstream() {
 func (h *handler) writeUpstream() {
 	select {
 	case <-h.ctx.Done():
-		return
+		h.logger.Debug("stopping writeUpstream")
 	case data := <-h.chanIngress:
 		datalen := len(data)
 		nwritten, err := h.upstream.Write(data)
